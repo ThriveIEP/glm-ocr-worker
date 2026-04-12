@@ -2,27 +2,50 @@
 
 Accepts base64-encoded images, returns OCR text.
 Uses transformers pipeline directly (0.9B model fits easily in 24GB VRAM).
+
+Fast cold starts require a pre-populated RunPod Network Volume mounted at
+/runpod-volume with HF_HOME=/runpod-volume/hf-cache set in the endpoint env.
+Without the volume, model downloads at startup (~3 min cold start).
 """
 
 import base64
 import io
 import os
+import sys
 import torch
 from PIL import Image
 from transformers import AutoModelForCausalLM, AutoProcessor
 
-# --- Model loading (runs once at container start, persists across requests) ---
+# --- Startup diagnostics (logged to RunPod worker logs) ---
 
 MODEL_NAME = os.environ.get("MODEL_NAME", "zai-org/GLM-OCR")
-
-# FIX-4: Pin to a known-good HF commit for trust_remote_code safety.
-# With trust_remote_code=True, from_pretrained() executes model Python files from HF Hub.
-# Without a pin, a compromised or updated zai-org/GLM-OCR repo could inject arbitrary code.
-# To pin: find the commit SHA at https://huggingface.co/zai-org/GLM-OCR/commits/main,
-# then set MODEL_REVISION env var in the RunPod endpoint config (or Dockerfile ARG).
 MODEL_REVISION = os.environ.get("MODEL_REVISION", "main")
+HF_HOME = os.environ.get("HF_HOME", os.path.expanduser("~/.cache/huggingface"))
+hf_cache_dir = os.path.join(HF_HOME, "hub")
 
-print(f"Loading {MODEL_NAME}@{MODEL_REVISION} ...")
+print(f"[glm-ocr] Starting worker — {MODEL_NAME}@{MODEL_REVISION}")
+print(f"[glm-ocr] HF_HOME: {HF_HOME}")
+
+volume_mounted = os.path.isdir("/runpod-volume")
+cache_populated = os.path.isdir(hf_cache_dir) and bool(os.listdir(hf_cache_dir))
+
+if volume_mounted and cache_populated:
+    print("[glm-ocr] Network volume mounted + model cache found — fast cold start.")
+elif volume_mounted and not cache_populated:
+    print("[glm-ocr] WARNING: Network volume mounted but cache is empty.")
+    print("[glm-ocr] Model will download now (~3 min). Pre-populate the volume to fix this.")
+    print("[glm-ocr] Run once on a pod: HF_HOME=/runpod-volume/hf-cache python -c \"")
+    print("[glm-ocr]   from transformers import AutoModelForCausalLM, AutoProcessor")
+    print(f"[glm-ocr]   AutoProcessor.from_pretrained('{MODEL_NAME}', trust_remote_code=True)")
+    print(f"[glm-ocr]   AutoModelForCausalLM.from_pretrained('{MODEL_NAME}', trust_remote_code=True)\"")
+else:
+    print("[glm-ocr] WARNING: No network volume at /runpod-volume.")
+    print("[glm-ocr] Model will download to container disk (~3 min, lost on worker shutdown).")
+    print("[glm-ocr] Attach a network volume at /runpod-volume for persistent caching.")
+
+# --- Model loading (runs once at container start, persists across requests) ---
+
+print(f"[glm-ocr] Loading model...")
 processor = AutoProcessor.from_pretrained(
     MODEL_NAME, revision=MODEL_REVISION, trust_remote_code=True
 )
@@ -30,19 +53,16 @@ model = AutoModelForCausalLM.from_pretrained(
     MODEL_NAME,
     revision=MODEL_REVISION,
     torch_dtype=torch.bfloat16,
-    device_map="auto",  # FIX-2: was device_map=DEVICE (bare string is invalid accelerate API)
+    device_map="auto",
     trust_remote_code=True,
 )
-# FIX-5: Use the tokenizer embedded in the processor rather than a separate AutoTokenizer load.
-# A separate load may resolve to a different vocab or special token mapping for VLMs.
 tokenizer = processor.tokenizer
-print(f"Model loaded. Device map: {model.hf_device_map}")
+print(f"[glm-ocr] Model loaded. Device map: {model.hf_device_map}")
 
 
 def decode_image(image_data: str) -> Image.Image:
     """Decode a base64-encoded image string to PIL Image."""
     if image_data.startswith("data:"):
-        # Strip data URI prefix (e.g., "data:image/png;base64,...")
         image_data = image_data.split(",", 1)[1]
     img_bytes = base64.b64decode(image_data)
     return Image.open(io.BytesIO(img_bytes)).convert("RGB")
@@ -50,7 +70,6 @@ def decode_image(image_data: str) -> Image.Image:
 
 def ocr_single_image(image: Image.Image, prompt: str = "OCR:") -> str:
     """Run OCR on a single image and return extracted text."""
-    # FIX-2: Move inputs to the actual model device (handles device_map="auto" placement)
     model_device = next(model.parameters()).device
     inputs = processor(
         images=image,
@@ -65,8 +84,6 @@ def ocr_single_image(image: Image.Image, prompt: str = "OCR:") -> str:
             do_sample=False,
         )
 
-    # Decode only the generated tokens (skip the input tokens).
-    # Defensive fallback if processor omits input_ids (non-standard VLM processors).
     input_len = inputs["input_ids"].shape[1] if "input_ids" in inputs else 0
     output_ids = generated_ids[:, input_len:]
     text = tokenizer.decode(output_ids[0], skip_special_tokens=True)
@@ -84,27 +101,19 @@ def handler(event):
       Single:   {"response": "extracted text"}
       Multiple: {"results": [{"index": 0, "response": "..."}, ...]}
       Error:    {"error": "message"}
-
-    Note: field name is "response" (not "text") to match glm-ocr-service.ts expectation.
     """
-    # FIX-6: Wrap entire handler in try/except so unhandled exceptions (CUDA OOM,
-    # corrupt input, tokenizer errors) return a structured error instead of crashing
-    # the worker process.
     try:
         job_input = event.get("input", {})
         prompt = job_input.get("prompt", "OCR:")
 
-        # Single image
         if "image" in job_input:
             image = decode_image(job_input["image"])
             text = ocr_single_image(image, prompt)
-            return {"response": text}  # FIX-1: was "text", must be "response" (matches server)
+            return {"response": text}
 
-        # Multiple images (batch)
         if "images" in job_input:
             results = []
             for i, img_data in enumerate(job_input["images"]):
-                # FIX-6: Per-image error isolation — one bad page doesn't abort the batch
                 try:
                     image = decode_image(img_data)
                     text = ocr_single_image(image, prompt)
