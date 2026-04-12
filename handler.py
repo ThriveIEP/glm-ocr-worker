@@ -3,61 +3,81 @@
 Accepts base64-encoded images, returns OCR text.
 Uses transformers pipeline directly (0.9B model fits easily in 24GB VRAM).
 
-Fast cold starts require a pre-populated RunPod Network Volume mounted at
-/runpod-volume with HF_HOME=/runpod-volume/hf-cache set in the endpoint env.
-Without the volume, model downloads at startup (~3 min cold start).
+Cold start behavior:
+- Worker signals ready immediately (health check passes in ~5s)
+- Model downloads in background (~2GB, ~2-3 min on first cold start)
+- First request blocks until model is ready; subsequent requests are fast
+- Network volume at /runpod-volume/hf-cache (HF_HOME) eliminates download on warm restarts
 """
 
 import base64
 import io
 import os
-import sys
+import threading
+import time
 import torch
 from PIL import Image
 from transformers import AutoModelForCausalLM, AutoProcessor
 
-# --- Startup diagnostics (logged to RunPod worker logs) ---
-
 MODEL_NAME = os.environ.get("MODEL_NAME", "zai-org/GLM-OCR")
 MODEL_REVISION = os.environ.get("MODEL_REVISION", "main")
 HF_HOME = os.environ.get("HF_HOME", os.path.expanduser("~/.cache/huggingface"))
-hf_cache_dir = os.path.join(HF_HOME, "hub")
 
-print(f"[glm-ocr] Starting worker — {MODEL_NAME}@{MODEL_REVISION}")
+print(f"[glm-ocr] Worker starting — {MODEL_NAME}@{MODEL_REVISION}")
 print(f"[glm-ocr] HF_HOME: {HF_HOME}")
 
 volume_mounted = os.path.isdir("/runpod-volume")
-cache_populated = os.path.isdir(hf_cache_dir) and bool(os.listdir(hf_cache_dir))
-
+cache_populated = os.path.isdir(os.path.join(HF_HOME, "hub")) and bool(
+    os.listdir(os.path.join(HF_HOME, "hub"))
+)
 if volume_mounted and cache_populated:
-    print("[glm-ocr] Network volume mounted + model cache found — fast cold start.")
-elif volume_mounted and not cache_populated:
-    print("[glm-ocr] WARNING: Network volume mounted but cache is empty.")
-    print("[glm-ocr] Model will download now (~3 min). Pre-populate the volume to fix this.")
-    print("[glm-ocr] Run once on a pod: HF_HOME=/runpod-volume/hf-cache python -c \"")
-    print("[glm-ocr]   from transformers import AutoModelForCausalLM, AutoProcessor")
-    print(f"[glm-ocr]   AutoProcessor.from_pretrained('{MODEL_NAME}', trust_remote_code=True)")
-    print(f"[glm-ocr]   AutoModelForCausalLM.from_pretrained('{MODEL_NAME}', trust_remote_code=True)\"")
+    print("[glm-ocr] Network volume cache found — model load will be fast.")
+elif volume_mounted:
+    print("[glm-ocr] Network volume mounted but cache empty — downloading ~2GB model.")
 else:
-    print("[glm-ocr] WARNING: No network volume at /runpod-volume.")
-    print("[glm-ocr] Model will download to container disk (~3 min, lost on worker shutdown).")
-    print("[glm-ocr] Attach a network volume at /runpod-volume for persistent caching.")
+    print("[glm-ocr] No network volume — downloading model to container disk (~2GB, ~2-3 min).")
+    print("[glm-ocr] Attach a network volume at /runpod-volume with pre-cached weights for fast starts.")
 
-# --- Model loading (runs once at container start, persists across requests) ---
+# --- Background model loading ---
+# Model loads in a daemon thread so runpod.serverless.start() can be called immediately.
+# RunPod health check passes as soon as start() is called (~5s), regardless of model load time.
+# Requests block on _model_ready until loading completes.
 
-print(f"[glm-ocr] Loading model...")
-processor = AutoProcessor.from_pretrained(
-    MODEL_NAME, revision=MODEL_REVISION, trust_remote_code=True
-)
-model = AutoModelForCausalLM.from_pretrained(
-    MODEL_NAME,
-    revision=MODEL_REVISION,
-    torch_dtype=torch.bfloat16,
-    device_map="auto",
-    trust_remote_code=True,
-)
-tokenizer = processor.tokenizer
-print(f"[glm-ocr] Model loaded. Device map: {model.hf_device_map}")
+_model_ready = threading.Event()
+_model_error: Exception | None = None
+processor = None
+model = None
+tokenizer = None
+
+
+def _load_model():
+    global processor, model, tokenizer, _model_error
+    try:
+        t0 = time.time()
+        print(f"[glm-ocr] Loading processor...")
+        processor = AutoProcessor.from_pretrained(
+            MODEL_NAME, revision=MODEL_REVISION, trust_remote_code=True
+        )
+        print(f"[glm-ocr] Loading model weights...")
+        model = AutoModelForCausalLM.from_pretrained(
+            MODEL_NAME,
+            revision=MODEL_REVISION,
+            torch_dtype=torch.bfloat16,
+            device_map="auto",
+            trust_remote_code=True,
+        )
+        tokenizer = processor.tokenizer
+        elapsed = time.time() - t0
+        print(f"[glm-ocr] Model ready in {elapsed:.1f}s. Device map: {model.hf_device_map}")
+    except Exception as e:
+        _model_error = e
+        print(f"[glm-ocr] ERROR loading model: {e}")
+    finally:
+        _model_ready.set()
+
+
+_load_thread = threading.Thread(target=_load_model, daemon=True, name="model-loader")
+_load_thread.start()
 
 
 def decode_image(image_data: str) -> Image.Image:
@@ -102,6 +122,14 @@ def handler(event):
       Multiple: {"results": [{"index": 0, "response": "..."}, ...]}
       Error:    {"error": "message"}
     """
+    # Wait for model to finish loading (blocks only on first cold-start request)
+    if not _model_ready.is_set():
+        print("[glm-ocr] Waiting for model to finish loading...")
+        _model_ready.wait()
+
+    if _model_error is not None:
+        return {"error": f"Model failed to load: {_model_error}"}
+
     try:
         job_input = event.get("input", {})
         prompt = job_input.get("prompt", "OCR:")
@@ -130,6 +158,8 @@ def handler(event):
 
 
 # --- RunPod entrypoint ---
+# Called immediately — before model finishes loading.
+# RunPod health check passes here; requests block in handler() until _model_ready is set.
 import runpod  # noqa: E402
 
 runpod.serverless.start({"handler": handler})
