@@ -34,10 +34,12 @@ RUN pip install --no-cache-dir \
 # Pin to a specific stable release for reproducibility.
 ARG TRANSFORMERS_VERSION=5.5.4
 
-# Install remaining Python dependencies
+# Install remaining Python dependencies.
+# Pin runpod==1.7.10 to avoid routing bug (SDK >1.7.10 routes all requests
+# to one worker: https://github.com/runpod/runpod-python/issues/432).
 RUN pip install --no-cache-dir \
     "transformers==${TRANSFORMERS_VERSION}" \
-    runpod \
+    "runpod==1.7.10" \
     pillow \
     accelerate \
     sentencepiece \
