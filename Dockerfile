@@ -70,4 +70,4 @@ ENV MODEL_REVISION=${MODEL_REVISION}
 ENV HF_HOME=/runpod-volume/hf-cache
 
 # RunPod serverless entrypoint
-CMD ["python", "-u", "handler.py"]
+CMD ["python3", "-u", "handler.py"]
