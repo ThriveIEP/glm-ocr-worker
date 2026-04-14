@@ -33,11 +33,16 @@ WORKDIR /app
 # to lock to a known-good commit and prevent silent regressions on rebuilds.
 ARG TRANSFORMERS_REF=main
 
-# Install Python dependencies
+# Install PyTorch with CUDA 12.1 support (must use --index-url, otherwise pip
+# installs CPU-only wheels which cannot access the GPU).
 RUN pip install --no-cache-dir \
-    runpod \
     torch \
     torchvision \
+    --index-url https://download.pytorch.org/whl/cu121
+
+# Install remaining Python dependencies
+RUN pip install --no-cache-dir \
+    runpod \
     pillow \
     accelerate \
     sentencepiece \
