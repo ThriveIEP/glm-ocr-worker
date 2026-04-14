@@ -71,3 +71,4 @@ ENV HF_HOME=/runpod-volume/hf-cache
 
 # RunPod serverless entrypoint
 CMD ["python3", "-u", "handler.py"]
+
