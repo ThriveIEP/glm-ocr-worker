@@ -1,12 +1,11 @@
 """RunPod Serverless handler for GLM-OCR (zai-org/GLM-OCR).
 
 Accepts base64-encoded images, returns OCR text.
-Uses transformers pipeline directly (0.9B model fits easily in 24GB VRAM).
+Uses the NATIVE transformers GlmOcrForConditionalGeneration class (no trust_remote_code).
 
 Cold start behavior:
 - All imports and model loading happen at module level (before start())
 - RUNPOD_INIT_TIMEOUT env var (default 600s) gives the worker enough time
-  to download and load the ~2GB model before RunPod's health check kills it
 - runpod.serverless.start() blocks as the main event loop
 """
 
@@ -35,7 +34,7 @@ except Exception as e:
 try:
     print("[glm-ocr] Importing transformers...", flush=True)
     import transformers
-    from transformers import AutoModelForCausalLM, AutoProcessor
+    from transformers import AutoProcessor, GlmOcrForConditionalGeneration
     print(f"[glm-ocr] transformers {transformers.__version__}", flush=True)
 except Exception as e:
     print(f"[glm-ocr] FATAL: transformers import failed: {e}", flush=True)
@@ -48,42 +47,31 @@ print("[glm-ocr] Importing runpod...", flush=True)
 import runpod
 
 # --- Model loading at module level (standard RunPod pattern) ---
-# This runs before runpod.serverless.start(). Set RUNPOD_INIT_TIMEOUT=600
-# in endpoint env vars so RunPod waits for this to complete.
-
 MODEL_NAME = os.environ.get("MODEL_NAME", "zai-org/GLM-OCR")
 MODEL_REVISION = os.environ.get("MODEL_REVISION", "main")
-HF_HOME = os.environ.get("HF_HOME", os.path.expanduser("~/.cache/huggingface"))
 
 print(f"[glm-ocr] Loading {MODEL_NAME}@{MODEL_REVISION}", flush=True)
-print(f"[glm-ocr] HF_HOME: {HF_HOME}", flush=True)
+print(f"[glm-ocr] HF_HOME: {os.environ.get('HF_HOME', '~/.cache/huggingface')}", flush=True)
 
 processor = None
 model = None
-tokenizer = None
 load_error = None
 
 try:
     t0 = time.time()
 
     print("[glm-ocr] Loading processor...", flush=True)
-    processor = AutoProcessor.from_pretrained(
-        MODEL_NAME, revision=MODEL_REVISION, trust_remote_code=False
-    )
+    processor = AutoProcessor.from_pretrained(MODEL_NAME, revision=MODEL_REVISION)
 
-    print("[glm-ocr] Loading model weights...", flush=True)
-    model = AutoModelForCausalLM.from_pretrained(
+    print("[glm-ocr] Loading model weights (native GlmOcrForConditionalGeneration)...", flush=True)
+    model = GlmOcrForConditionalGeneration.from_pretrained(
         MODEL_NAME,
         revision=MODEL_REVISION,
         torch_dtype=torch.bfloat16,
         device_map="auto",
-        trust_remote_code=False,
     )
-    tokenizer = processor.tokenizer
 
     # --- Monkey-patch Conv3d → F.linear for patch embedding ---
-    # GLM-OCR's vision encoder produces ~22k patches, each dispatching a
-    # separate CUDA Conv3d kernel. This is the known perf bottleneck.
     try:
         base_model = model.model if hasattr(model, "model") else model
         if hasattr(base_model, "visual") and hasattr(base_model.visual, "patch_embed"):
@@ -109,7 +97,9 @@ try:
         print(f"[glm-ocr] WARN: Monkey patch failed (non-fatal): {mp_err}", flush=True)
 
     elapsed = time.time() - t0
-    print(f"[glm-ocr] Model ready in {elapsed:.1f}s. Device map: {model.hf_device_map}", flush=True)
+    print(f"[glm-ocr] Model ready in {elapsed:.1f}s", flush=True)
+    if hasattr(model, "hf_device_map"):
+        print(f"[glm-ocr] Device map: {model.hf_device_map}", flush=True)
 
 except Exception as e:
     load_error = e
@@ -128,21 +118,35 @@ def decode_image(image_data: str) -> Image.Image:
 
 
 def ocr_single_image(image: Image.Image, prompt: str = "OCR:") -> str:
-    """Run OCR on a single image and return extracted text."""
+    """Run OCR on a single image using native transformers chat template API."""
     t0 = time.time()
-    model_device = next(model.parameters()).device
-    inputs = processor(
-        images=image, text=prompt, return_tensors="pt"
-    ).to(model_device)
+
+    # Native transformers API uses apply_chat_template
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "image"},
+                {"type": "text", "text": prompt},
+            ],
+        }
+    ]
+
+    inputs = processor.apply_chat_template(
+        messages,
+        images=[image],
+        tokenize=True,
+        add_generation_prompt=True,
+        return_dict=True,
+        return_tensors="pt",
+    ).to(model.device)
 
     with torch.no_grad():
-        generated_ids = model.generate(
-            **inputs, max_new_tokens=4096, do_sample=False
-        )
+        generated_ids = model.generate(**inputs, max_new_tokens=4096, do_sample=False)
 
-    input_len = inputs["input_ids"].shape[1] if "input_ids" in inputs else 0
+    input_len = inputs["input_ids"].shape[1]
     output_ids = generated_ids[:, input_len:]
-    text = tokenizer.decode(output_ids[0], skip_special_tokens=True)
+    text = processor.decode(output_ids[0], skip_special_tokens=True)
     elapsed = time.time() - t0
     print(f"[glm-ocr] Generated {len(output_ids[0])} tokens in {elapsed:.1f}s", flush=True)
     return text.strip()
@@ -193,7 +197,5 @@ def handler(event):
 
 
 # --- RunPod entrypoint ---
-# start() blocks — it IS the main event loop. Everything above runs first.
-# RUNPOD_INIT_TIMEOUT env var controls how long RunPod waits before this point.
 print("[glm-ocr] Calling runpod.serverless.start()...", flush=True)
 runpod.serverless.start({"handler": handler})
