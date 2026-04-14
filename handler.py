@@ -16,6 +16,7 @@ import os
 import threading
 import time
 import torch
+import torch.nn.functional as F
 from PIL import Image
 from transformers import AutoModelForCausalLM, AutoProcessor
 
@@ -67,6 +68,38 @@ def _load_model():
             trust_remote_code=True,
         )
         tokenizer = processor.tokenizer
+
+        # --- Monkey-patch Conv3d → F.linear for patch embedding ---
+        # GLM-OCR's vision encoder produces ~22k patches, each dispatching a
+        # separate CUDA Conv3d kernel. This is the known perf bottleneck:
+        # ~30s/image on H100 with Conv3d vs ~1s with linear.
+        # See: https://huggingface.co/zai-org/GLM-OCR/discussions/36
+        try:
+            base_model = model.model if hasattr(model, "model") else model
+            if hasattr(base_model, "visual") and hasattr(base_model.visual, "patch_embed"):
+                patch_embed = base_model.visual.patch_embed
+                proj = patch_embed.proj
+                in_features = (
+                    patch_embed.in_channels
+                    * patch_embed.temporal_patch_size
+                    * patch_embed.patch_size ** 2
+                )
+                embed_dim = patch_embed.embed_dim
+                weight = proj.weight
+                bias = proj.bias
+
+                def _fast_forward(hidden_states: torch.Tensor) -> torch.Tensor:
+                    target_dtype = weight.dtype
+                    hidden_states = hidden_states.reshape(-1, in_features).to(dtype=target_dtype)
+                    return F.linear(hidden_states, weight.reshape(embed_dim, -1), bias)
+
+                patch_embed.forward = _fast_forward
+                print("[glm-ocr] Applied Conv3d→linear monkey patch (22k patch speedup)")
+            else:
+                print("[glm-ocr] WARN: Could not find visual.patch_embed — skipping monkey patch")
+        except Exception as mp_err:
+            print(f"[glm-ocr] WARN: Monkey patch failed (non-fatal): {mp_err}")
+
         elapsed = time.time() - t0
         print(f"[glm-ocr] Model ready in {elapsed:.1f}s. Device map: {model.hf_device_map}")
     except Exception as e:
@@ -88,14 +121,32 @@ def decode_image(image_data: str) -> Image.Image:
     return Image.open(io.BytesIO(img_bytes)).convert("RGB")
 
 
+def _log_memory():
+    """Log GPU and system memory usage for diagnostics."""
+    if torch.cuda.is_available():
+        alloc = torch.cuda.memory_allocated() / 1024**3
+        reserved = torch.cuda.memory_reserved() / 1024**3
+        print(f"[glm-ocr] GPU mem: {alloc:.1f}GB allocated, {reserved:.1f}GB reserved")
+    try:
+        import psutil
+        vm = psutil.virtual_memory()
+        print(f"[glm-ocr] System RAM: {vm.used/1024**3:.1f}GB/{vm.total/1024**3:.1f}GB ({vm.percent}%)")
+    except ImportError:
+        pass
+
+
 def ocr_single_image(image: Image.Image, prompt: str = "OCR:") -> str:
     """Run OCR on a single image and return extracted text."""
+    t0 = time.time()
     model_device = next(model.parameters()).device
     inputs = processor(
         images=image,
         text=prompt,
         return_tensors="pt",
     ).to(model_device)
+
+    _log_memory()
+    print(f"[glm-ocr] Starting generate (input_ids shape: {inputs.get('input_ids', torch.tensor([])).shape})...")
 
     with torch.no_grad():
         generated_ids = model.generate(
@@ -107,6 +158,9 @@ def ocr_single_image(image: Image.Image, prompt: str = "OCR:") -> str:
     input_len = inputs["input_ids"].shape[1] if "input_ids" in inputs else 0
     output_ids = generated_ids[:, input_len:]
     text = tokenizer.decode(output_ids[0], skip_special_tokens=True)
+    elapsed = time.time() - t0
+    print(f"[glm-ocr] Generated {len(output_ids[0])} tokens in {elapsed:.1f}s")
+    _log_memory()
     return text.strip()
 
 
