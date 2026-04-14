@@ -35,7 +35,7 @@ ARG TRANSFORMERS_REF=main
 
 # Install Python dependencies
 RUN pip install --no-cache-dir \
-    "runpod>=1.7.0,<1.9.0" \
+    runpod \
     torch \
     torchvision \
     pillow \
