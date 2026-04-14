@@ -10,11 +10,13 @@ Cold start behavior:
 - Network volume at /runpod-volume/hf-cache (HF_HOME) eliminates download on warm restarts
 """
 
+import sys
 import base64
 import io
 import os
 import threading
 import time
+from typing import Optional
 import torch
 import torch.nn.functional as F
 from PIL import Image
@@ -24,6 +26,7 @@ MODEL_NAME = os.environ.get("MODEL_NAME", "zai-org/GLM-OCR")
 MODEL_REVISION = os.environ.get("MODEL_REVISION", "main")
 HF_HOME = os.environ.get("HF_HOME", os.path.expanduser("~/.cache/huggingface"))
 
+print(f"[glm-ocr] Python {sys.version}")
 print(f"[glm-ocr] Worker starting — {MODEL_NAME}@{MODEL_REVISION}")
 print(f"[glm-ocr] HF_HOME: {HF_HOME}")
 
@@ -45,7 +48,7 @@ else:
 # Requests block on _model_ready until loading completes.
 
 _model_ready = threading.Event()
-_model_error: Exception | None = None
+_model_error: Optional[Exception] = None
 processor = None
 model = None
 tokenizer = None
