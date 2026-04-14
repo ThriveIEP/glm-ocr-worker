@@ -68,7 +68,7 @@ try:
 
     print("[glm-ocr] Loading processor...", flush=True)
     processor = AutoProcessor.from_pretrained(
-        MODEL_NAME, revision=MODEL_REVISION, trust_remote_code=True
+        MODEL_NAME, revision=MODEL_REVISION, trust_remote_code=False
     )
 
     print("[glm-ocr] Loading model weights...", flush=True)
@@ -77,7 +77,7 @@ try:
         revision=MODEL_REVISION,
         torch_dtype=torch.bfloat16,
         device_map="auto",
-        trust_remote_code=True,
+        trust_remote_code=False,
     )
     tokenizer = processor.tokenizer
 

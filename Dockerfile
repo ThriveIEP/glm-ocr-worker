@@ -67,6 +67,8 @@ ENV MODEL_REVISION=${MODEL_REVISION}
 # Override to /runpod-volume/hf-cache via endpoint env vars when a network volume
 # is attached for persistent caching across worker restarts.
 ENV HF_HOME=/root/.cache/huggingface
+# Enable hf_transfer for faster parallel model downloads (pre-installed in runpod/base).
+ENV HF_HUB_ENABLE_HF_TRANSFER=1
 
 # RunPod serverless entrypoint
 CMD ["python3", "-u", "handler.py"]
